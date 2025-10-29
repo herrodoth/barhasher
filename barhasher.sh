@@ -51,10 +51,9 @@ gen_salt() {
   openssl rand -base64 16
 }
 
-# calculeaza exponentul -m (in KiB) din MEM_MIB (accepta puteri ale lui 2)
+# calculeaza exponentul -m (in KiB) din MEM_MIB (accepta doar puteri ale lui 2)
 calc_mexp_from_mib() {
   local mib="$1"
-  # validare numeric
   [[ "$mib" =~ ^[0-9]+$ ]] || { echo ""; return; }
   local kib=$((mib * 1024))
   local orig="$kib"
@@ -65,7 +64,6 @@ calc_mexp_from_mib() {
     kib=$((kib/2))
     exp=$((exp+1))
   done
-  # verifica 2^exp == orig
   if [ $((1<<exp)) -ne "$orig" ]; then echo ""; else echo "$exp"; fi
 }
 
@@ -115,154 +113,237 @@ can_gui() { [ -z "${NO_GUI:-}" ] && have yad && { [ -n "${DISPLAY:-}" ] || [ -n 
 can_dialog() { have dialog; }
 can_whiptail() { have whiptail; }
 
-# --------- GUI (YAD) ---------
+# --------- GUI (YAD) cu loop ---------
 run_gui() {
   for tool in argon2 openssl yad; do have "$tool" || die "❌ $tool nu este instalat. Instaleaza: sudo apt install $tool"; done
 
-  local copy_default="FALSE"; [ -n "$CLIP_CMD" ] && copy_default="TRUE"
-  local result status
-  result=$(
-    yad --form \
-      --title="Argon2 Hash Generator" \
-      --image=dialog-password \
-      --center --borders=12 \
-      --text="Introdu parola si selecteaza optiunile (argon2id recomandat pentru parole):" \
-      --field="Parola:":H '' \
-      --field="Confirma parola:":H '' \
-      --field="Tip Argon2:CB" "argon2id!argon2i!argon2d" \
-      --field="Iteratii (t):NUM" "$T!1..10!1" \
-      --field="Memorie (MiB):CB" "4!8!16!32!64!128!256!512!1024!2048!4096" \
-      --field="Paralelism (p):NUM" "$P!1..16!1" \
-      --field="Lungime hash (octeti):NUM" "$LEN!16..64!1" \
-      --field="Salt (base64, optional):" "$SALT_INPUT" \
-      --field="Genereaza salt random:CHK" "$GEN_SALT" \
-      --field="Salveaza in fisier:CHK" "$SAVE_TO_FILE" \
-      --field="Fisier iesire:FL" "$OUT_PATH" \
-      --field="Copiaza in clipboard:CHK" "$copy_default" \
-      --field="Auto-clear clipboard (sec):NUM" "$AUTOCLEAR!0..600!5" \
-      --button="Genereaza!gtk-ok:0" --button="Anuleaza!gtk-cancel:1" \
-      --width=560 --height=420
-  ); status=$?
-  [ $status -ne 0 ] && exit 0
-  local pw pw2 copy_to_clip
-  IFS="|" read -r pw pw2 TYPE T MEM_MIB P LEN SALT_INPUT GEN_SALT SAVE_TO_FILE OUT_PATH copy_to_clip AUTOCLEAR <<< "$result"
-  [ -z "$pw" ] && die "Parola nu poate fi goala."
-  [ "$pw" != "$pw2" ] && die "Parolele nu coincid."
-  COPY_TO_CLIPBOARD="$copy_to_clip"
+  local copy_default="$([ -n "$CLIP_CMD" ] && echo TRUE || echo FALSE)"
 
-  local hash
-  hash=$(do_hash "$pw") || die "Eroare la generarea hash-ului."
-  unset pw pw2
+  while :; do
+    local result status
+    result=$(
+      yad --form \
+        --title="Argon2 Hash Generator" \
+        --image=dialog-password \
+        --center --borders=12 \
+        --text="Introdu parola si selecteaza optiunile (argon2id recomandat pentru parole):\n\n[Fereastra ramane deschisa. Apasa Anuleaza sau inchide pentru a iesi.]" \
+        --field="Parola:":H '' \
+        --field="Confirma parola:":H '' \
+        --field="Tip Argon2:CB" "argon2id!argon2i!argon2d" \
+        --field="Iteratii (t):NUM" "$T!1..10!1" \
+        --field="Memorie (MiB):CB" "4!8!16!32!64!128!256!512!1024!2048!4096" \
+        --field="Paralelism (p):NUM" "$P!1..16!1" \
+        --field="Lungime hash (octeti):NUM" "$LEN!16..64!1" \
+        --field="Salt (base64, optional):" "$SALT_INPUT" \
+        --field="Genereaza salt random:CHK" "$GEN_SALT" \
+        --field="Salveaza in fisier:CHK" "$SAVE_TO_FILE" \
+        --field="Fisier iesire:FL" "$OUT_PATH" \
+        --field="Copiaza in clipboard:CHK" "$copy_default" \
+        --field="Auto-clear clipboard (sec):NUM" "$AUTOCLEAR!0..600!5" \
+        --button="Genereaza!gtk-ok:0" --button="Anuleaza!gtk-cancel:1" \
+        --width=560 --height=420
+    ); status=$?
 
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then
-    write_secure_file "$OUT_PATH" "$hash" || die "Nu am putut scrie in fisier: $OUT_PATH"
-  fi
+    # Inchidere/Cancel => iesim din bucla GUI
+    if [ $status -ne 0 ]; then
+      break
+    fi
 
-  copy_with_autoclear "$hash" "$AUTOCLEAR"
+    # Proceseaza intrarile
+    local pw pw2 copy_to_clip
+    IFS="|" read -r pw pw2 TYPE T MEM_MIB P LEN SALT_INPUT GEN_SALT SAVE_TO_FILE OUT_PATH copy_to_clip AUTOCLEAR <<< "$result"
+    if [ -z "$pw" ]; then
+      yad --center --image=dialog-error --text="Parola nu poate fi goala." --button=OK:0
+      continue
+    fi
+    if [ "$pw" != "$pw2" ]; then
+      yad --center --image=dialog-error --text="Parolele nu coincid." --button=OK:0
+      continue
+    fi
+    COPY_TO_CLIPBOARD="$copy_to_clip"
 
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then
-    yad --text-info --title="Hash generat (din fisier)" --filename="$OUT_PATH" --width=700 --height=250 --center --borders=10
-  else
-    printf "%s\n" "$hash" | yad --text-info --title="Hash generat" --width=700 --height=250 --center --borders=10
-  fi
+    # Genereaza hash
+    local hash
+    if ! hash=$(do_hash "$pw"); then
+      yad --center --image=dialog-error --text="Eroare la generarea hash-ului." --button=OK:0
+      unset pw pw2
+      continue
+    fi
+    unset pw pw2
+
+    # Scrie fisier, daca e cazul
+    if [ "$SAVE_TO_FILE" = "TRUE" ]; then
+      if ! write_secure_file "$OUT_PATH" "$hash"; then
+        yad --center --image=dialog-error --text="Nu am putut scrie in fisier: $OUT_PATH" --button=OK:0
+      fi
+    fi
+
+    # Clipboard + autoclear
+    copy_with_autoclear "$hash" "$AUTOCLEAR"
+
+    # Afiseaza rezultatul intr-o fereastra separata
+    if [ "$SAVE_TO_FILE" = "TRUE" ]; then
+      yad --text-info --title="Hash generat (din fisier)" --filename="$OUT_PATH" \
+          --width=700 --height=250 --center --borders=10 --button=OK:0 &
+    else
+      printf "%s\n" "$hash" | yad --text-info --title="Hash generat" \
+          --width=700 --height=250 --center --borders=10 --button=OK:0 &
+    fi
+    # Bucla continua => fereastra principala reapare pentru o noua generare
+  done
 }
 
-# --------- TUI (dialog) ---------
+# --------- TUI (dialog) cu loop ---------
 run_tui_dialog() {
   for tool in argon2 openssl dialog; do have "$tool" || die "❌ $tool nu este instalat. Instaleaza: sudo apt install $tool"; done
-  local pw pw2 resp
 
-  resp=$(dialog --insecure --passwordbox "Parola:" 10 60 3>&1 1>&2 2>&3) || exit 0; pw="$resp"
-  resp=$(dialog --insecure --passwordbox "Confirma parola:" 10 60 3>&1 1>&2 2>&3) || exit 0; pw2="$resp"
-  [ -z "$pw" ] && die "Parola nu poate fi goala."
-  [ "$pw" != "$pw2" ] && die "Parolele nu coincid."
+  while :; do
+    local pw pw2 resp
 
-  resp=$(dialog --menu "Tip Argon2" 12 60 3 "argon2id" "Recomandat" "argon2i" "Side-channel" "argon2d" "GPU" 3>&1 1>&2 2>&3) || exit 0; TYPE="$resp"
-  resp=$(dialog --inputbox "Iteratii (t) [implicit $T]:" 10 60 "$T" 3>&1 1>&2 2>&3) || exit 0; T="$resp"
-  resp=$(dialog --menu "Memorie (MiB)" 14 60 11 4 "" 8 "" 16 "" 32 "" 64 "" 128 "" 256 "" 512 "" 1024 "" 2048 "" 4096 "" 3>&1 1>&2 2>&3) || exit 0; MEM_MIB="$resp"
-  resp=$(dialog --inputbox "Paralelism (p) [implicit $P]:" 10 60 "$P" 3>&1 1>&2 2>&3) || exit 0; P="$resp"
-  resp=$(dialog --inputbox "Lungime hash (octeti) [implicit $LEN]:" 10 60 "$LEN" 3>&1 1>&2 2>&3) || exit 0; LEN="$resp"
+    resp=$(dialog --insecure --passwordbox "Parola:" 10 60 3>&1 1>&2 2>&3) || break
+    pw="$resp"
+    resp=$(dialog --insecure --passwordbox "Confirma parola:" 10 60 3>&1 1>&2 2>&3) || break
+    pw2="$resp"
+    [ -z "$pw" ] && { dialog --msgbox "Parola nu poate fi goala." 8 50; continue; }
+    [ "$pw" != "$pw2" ] && { dialog --msgbox "Parolele nu coincid." 8 50; continue; }
 
-  if dialog --yesno "Genereaza salt random?" 8 60; then GEN_SALT="TRUE"; SALT_INPUT=""; else GEN_SALT="FALSE"; SALT_INPUT=$(dialog --inputbox "Salt (base64):" 10 60 3>&1 1>&2 2>&3) || exit 0; fi
-  if dialog --yesno "Salveaza in fisier?" 8 60; then
-    SAVE_TO_FILE="TRUE"
-    OUT_PATH=$(dialog --fselect "$OUT_PATH" 15 70 3>&1 1>&2 2>&3) || exit 0
-    [ -z "$OUT_PATH" ] && die "Cale fisier lipsa."
-  else SAVE_TO_FILE="FALSE"; fi
+    resp=$(dialog --menu "Tip Argon2" 12 60 3 \
+        "argon2id" "Recomandat" "argon2i" "Side-channel" "argon2d" "GPU" 3>&1 1>&2 2>&3) || break
+    TYPE="$resp"
+    resp=$(dialog --inputbox "Iteratii (t) [implicit $T]:" 10 60 "$T" 3>&1 1>&2 2>&3) || break; T="$resp"
+    resp=$(dialog --menu "Memorie (MiB)" 14 60 11 4 "" 8 "" 16 "" 32 "" 64 "" 128 "" 256 "" 512 "" 1024 "" 2048 "" 4096 "" 3>&1 1>&2 2>&3) || break; MEM_MIB="$resp"
+    resp=$(dialog --inputbox "Paralelism (p) [implicit $P]:" 10 60 "$P" 3>&1 1>&2 2>&3) || break; P="$resp"
+    resp=$(dialog --inputbox "Lungime hash (octeti) [implicit $LEN]:" 10 60 "$LEN" 3>&1 1>&2 2>&3) || break; LEN="$resp"
 
-  if dialog --yesno "Copiaza in clipboard?" 8 60; then COPY_TO_CLIPBOARD="TRUE"; AUTOCLEAR=$(dialog --inputbox "Auto-clear (sec) [0=off]:" 10 60 "$AUTOCLEAR" 3>&1 1>&2 2>&3) || exit 0; else COPY_TO_CLIPBOARD="FALSE"; fi
+    if dialog --yesno "Genereaza salt random?" 8 60; then GEN_SALT="TRUE"; SALT_INPUT=""; else
+      GEN_SALT="FALSE"
+      SALT_INPUT=$(dialog --inputbox "Salt (base64):" 10 60 3>&1 1>&2 2>&3) || break
+    fi
+    if dialog --yesno "Salveaza in fisier?" 8 60; then
+      SAVE_TO_FILE="TRUE"
+      OUT_PATH=$(dialog --fselect "$OUT_PATH" 15 70 3>&1 1>&2 2>&3) || break
+      [ -z "$OUT_PATH" ] && { dialog --msgbox "Cale fisier lipsa." 8 50; continue; }
+    else
+      SAVE_TO_FILE="FALSE"
+    fi
+    if dialog --yesno "Copiaza in clipboard?" 8 60; then
+      COPY_TO_CLIPBOARD="TRUE"
+      AUTOCLEAR=$(dialog --inputbox "Auto-clear clipboard (sec) [0=off]:" 10 60 "$AUTOCLEAR" 3>&1 1>&2 2>&3) || break
+    else
+      COPY_TO_CLIPBOARD="FALSE"
+    fi
 
-  local hash
-  hash=$(do_hash "$pw") || die "Eroare la generarea hash-ului."
-  unset pw pw2
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then write_secure_file "$OUT_PATH" "$hash" || die "Nu am putut scrie in fisier: $OUT_PATH"; fi
-  copy_with_autoclear "$hash" "$AUTOCLEAR"
+    local hash
+    if ! hash=$(do_hash "$pw"); then dialog --msgbox "Eroare la generarea hash-ului." 8 50; unset pw pw2; continue; fi
+    unset pw pw2
 
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then dialog --title "Hash generat (din fisier)" --textbox "$OUT_PATH" 12 80; else dialog --title "Hash generat" --msgbox "$hash" 12 80; fi
+    if [ "$SAVE_TO_FILE" = "TRUE" ]; then
+      if ! write_secure_file "$OUT_PATH" "$hash"; then dialog --msgbox "Nu am putut scrie in fisier: $OUT_PATH" 8 60; fi
+      dialog --title "Hash generat (din fisier)" --textbox "$OUT_PATH" 12 80
+    else
+      dialog --title "Hash generat" --msgbox "$hash" 12 80
+    fi
+
+    copy_with_autoclear "$hash" "$AUTOCLEAR"
+
+    dialog --yesno "Generezi alt hash?" 8 50 || break
+  done
 }
 
-# --------- TUI (whiptail) ---------
+# --------- TUI (whiptail) cu loop ---------
 run_tui_whiptail() {
   for tool in argon2 openssl whiptail; do have "$tool" || die "❌ $tool nu este instalat. Instaleaza: sudo apt install $tool"; done
-  local pw pw2
-  pw=$(whiptail --passwordbox "Parola:" 10 60 3>&1 1>&2 2>&3) || exit 0
-  pw2=$(whiptail --passwordbox "Confirma parola:" 10 60 3>&1 1>&2 2>&3) || exit 0
-  [ -z "$pw" ] && die "Parola nu poate fi goala."
-  [ "$pw" != "$pw2" ] && die "Parolele nu coincid."
 
-  TYPE=$(whiptail --nocancel --notags --menu "Tip Argon2" 12 60 3 "argon2id" "Recomandat" "argon2i" "Side-channel" "argon2d" "GPU" 3>&1 1>&2 2>&3)
-  T=$(whiptail --inputbox "Iteratii (t) [implicit $T]:" 10 60 "$T" 3>&1 1>&2 2>&3) || exit 0
-  MEM_MIB=$(whiptail --nocancel --menu "Memorie (MiB)" 14 60 11 4 "" 8 "" 16 "" 32 "" 64 "" 128 "" 256 "" 512 "" 1024 "" 2048 "" 4096 "" 3>&1 1>&2 2>&3)
-  P=$(whiptail --inputbox "Paralelism (p) [implicit $P]:" 10 60 "$P" 3>&1 1>&2 2>&3) || exit 0
-  LEN=$(whiptail --inputbox "Lungime hash (octeti) [implicit $LEN]:" 10 60 "$LEN" 3>&1 1>&2 2>&3) || exit 0
+  while :; do
+    local pw pw2
 
-  if whiptail --yesno "Genereaza salt random?" 8 60; then GEN_SALT="TRUE"; SALT_INPUT=""; else GEN_SALT="FALSE"; SALT_INPUT=$(whiptail --inputbox "Salt (base64):" 10 60 3>&1 1>&2 2>&3) || exit 0; fi
-  if whiptail --yesno "Salveaza in fisier?" 8 60; then SAVE_TO_FILE="TRUE"; OUT_PATH=$(whiptail --inputbox "Cale fisier:" 10 60 "$OUT_PATH" 3>&1 1>&2 2>&3) || exit 0; [ -z "$OUT_PATH" ] && die "Cale fisier lipsa."; else SAVE_TO_FILE="FALSE"; fi
-  if whiptail --yesno "Copiaza in clipboard?" 8 60; then COPY_TO_CLIPBOARD="TRUE"; AUTOCLEAR=$(whiptail --inputbox "Auto-clear (sec) [0=off]:" 10 60 "$AUTOCLEAR" 3>&1 1>&2 2>&3) || exit 0; else COPY_TO_CLIPBOARD="FALSE"; fi
+    pw=$(whiptail --passwordbox "Parola:" 10 60 3>&1 1>&2 2>&3) || break
+    pw2=$(whiptail --passwordbox "Confirma parola:" 10 60 3>&1 1>&2 2>&3) || break
+    [ -z "$pw" ] && { whiptail --msgbox "Parola nu poate fi goala." 8 50; continue; }
+    [ "$pw" != "$pw2" ] && { whiptail --msgbox "Parolele nu coincid." 8 50; continue; }
 
-  local hash
-  hash=$(do_hash "$pw") || die "Eroare la generarea hash-ului."
-  unset pw pw2
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then write_secure_file "$OUT_PATH" "$hash" || die "Nu am putut scrie in fisier: $OUT_PATH"; fi
-  copy_with_autoclear "$hash" "$AUTOCLEAR"
+    TYPE=$(whiptail --nocancel --notags --menu "Tip Argon2" 12 60 3 "argon2id" "Recomandat" "argon2i" "Side-channel" "argon2d" "GPU" 3>&1 1>&2 2>&3)
+    T=$(whiptail --inputbox "Iteratii (t) [implicit $T]:" 10 60 "$T" 3>&1 1>&2 2>&3) || break
+    MEM_MIB=$(whiptail --nocancel --menu "Memorie (MiB)" 14 60 11 4 "" 8 "" 16 "" 32 "" 64 "" 128 "" 256 "" 512 "" 1024 "" 2048 "" 4096 "" 3>&1 1>&2 2>&3)
+    P=$(whiptail --inputbox "Paralelism (p) [implicit $P]:" 10 60 "$P" 3>&1 1>&2 2>&3) || break
+    LEN=$(whiptail --inputbox "Lungime hash (octeti) [implicit $LEN]:" 10 60 "$LEN" 3>&1 1>&2 2>&3) || break
 
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then whiptail --title "Hash generat (din fisier)" --textbox "$OUT_PATH" 12 80; else whiptail --msgbox "$hash" 12 80; fi
+    if whiptail --yesno "Genereaza salt random?" 8 60; then GEN_SALT="TRUE"; SALT_INPUT=""; else
+      GEN_SALT="FALSE"; SALT_INPUT=$(whiptail --inputbox "Salt (base64):" 10 60 3>&1 1>&2 2>&3) || break
+    fi
+    if whiptail --yesno "Salveaza in fisier?" 8 60; then
+      SAVE_TO_FILE="TRUE"
+      OUT_PATH=$(whiptail --inputbox "Cale fisier:" 10 60 "$OUT_PATH" 3>&1 1>&2 2>&3) || break
+      [ -z "$OUT_PATH" ] && { whiptail --msgbox "Cale fisier lipsa." 8 50; continue; }
+    else
+      SAVE_TO_FILE="FALSE"
+    fi
+    if whiptail --yesno "Copiaza in clipboard?" 8 60; then
+      COPY_TO_CLIPBOARD="TRUE"
+      AUTOCLEAR=$(whiptail --inputbox "Auto-clear clipboard (sec) [0=off]:" 10 60 "$AUTOCLEAR" 3>&1 1>&2 2>&3) || break
+    else
+      COPY_TO_CLIPBOARD="FALSE"
+    fi
+
+    local hash
+    if ! hash=$(do_hash "$pw"); then whiptail --msgbox "Eroare la generarea hash-ului." 8 50; unset pw pw2; continue; fi
+    unset pw pw2
+
+    if [ "$SAVE_TO_FILE" = "TRUE" ]; then
+      if ! write_secure_file "$OUT_PATH" "$hash"; then whiptail --msgbox "Nu am putut scrie in fisier: $OUT_PATH" 8 60; fi
+      whiptail --title "Hash generat (din fisier)" --textbox "$OUT_PATH" 12 80
+    else
+      whiptail --msgbox "$hash" 12 80
+    fi
+
+    copy_with_autoclear "$hash" "$AUTOCLEAR"
+
+    whiptail --yesno "Generezi alt hash?" 8 50 || break
+  done
 }
 
-# --------- CLI interactiv (prompturi) ---------
+# --------- CLI interactiv (prompturi) cu loop ---------
 run_cli_interactive() {
   for tool in argon2 openssl; do have "$tool" || die "❌ $tool nu este instalat. Instaleaza: sudo apt install $tool"; done
-  local pw pw2 resp
-  read -r -s -p "Parola: " pw; echo
-  read -r -s -p "Confirma parola: " pw2; echo
-  [ -z "$pw" ] && die "Parola nu poate fi goala."
-  [ "$pw" != "$pw2" ] && die "Parolele nu coincid."
 
-  echo -n "Tip Argon2 [argon2id/argon2i/argon2d] (implicit: $TYPE): "; read -r resp; [ -n "$resp" ] && TYPE="$resp"
-  echo -n "Iteratii (t) (implicit: $T): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && T="$resp"
-  echo "Memorie (MiB) (puteri ale lui 2) (implicit: $MEM_MIB): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && MEM_MIB="$resp"
-  echo -n "Paralelism (p) (implicit: $P): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && P="$resp"
-  echo -n "Lungime hash (octeti) (implicit: $LEN): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && LEN="$resp"
+  while :; do
+    local pw pw2 resp
+    read -r -s -p "Parola: " pw; echo
+    read -r -s -p "Confirma parola: " pw2; echo
+    [ -z "$pw" ] && { echo "Parola nu poate fi goala."; continue; }
+    [ "$pw" != "$pw2" ] && { echo "Parolele nu coincid."; continue; }
 
-  echo -n "Genereaza salt random? [Y/n] (implicit: Y): "; read -r resp
-  if [[ "$resp" =~ ^([nN]|no|No)$ ]]; then GEN_SALT="FALSE"; echo -n "Salt (base64): "; read -r SALT_INPUT; else GEN_SALT="TRUE"; SALT_INPUT=""; fi
+    echo -n "Tip Argon2 [argon2id/argon2i/argon2d] (implicit: $TYPE): "; read -r resp; [ -n "$resp" ] && TYPE="$resp"
+    echo -n "Iteratii (t) (implicit: $T): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && T="$resp"
+    echo "Memorie (MiB, puteri ale lui 2) (implicit: $MEM_MIB): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && MEM_MIB="$resp"
+    echo -n "Paralelism (p) (implicit: $P): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && P="$resp"
+    echo -n "Lungime hash (octeti) (implicit: $LEN): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && LEN="$resp"
 
-  echo -n "Salveaza in fisier? [y/N] (implicit: N): "; read -r resp
-  if [[ "$resp" =~ ^([yY]|yes|Yes)$ ]]; then SAVE_TO_FILE="TRUE"; echo -n "Cale fisier (implicit: $OUT_PATH): "; read -r resp; [ -n "$resp" ] && OUT_PATH="$resp"; else SAVE_TO_FILE="FALSE"; fi
+    echo -n "Genereaza salt random? [Y/n] (implicit: Y): "; read -r resp
+    if [[ "$resp" =~ ^([nN]|no|No)$ ]]; then GEN_SALT="FALSE"; echo -n "Salt (base64): "; read -r SALT_INPUT; else GEN_SALT="TRUE"; SALT_INPUT=""; fi
 
-  local def_clip=$( [ "$COPY_TO_CLIPBOARD" = "TRUE" ] && echo "Y" || echo "N" )
-  echo -n "Copiaza in clipboard? [Y/n] (implicit: $def_clip): "; read -r resp
-  if [[ "$resp" =~ ^([nN]|no|No)$ ]]; then COPY_TO_CLIPBOARD="FALSE"; fi
-  if [ "$COPY_TO_CLIPBOARD" = "TRUE" ]; then echo -n "Auto-clear clipboard (sec) [0 = off] (implicit: $AUTOCLEAR): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && AUTOCLEAR="$resp"; fi
+    echo -n "Salveaza in fisier? [y/N] (implicit: N): "; read -r resp
+    if [[ "$resp" =~ ^([yY]|yes|Yes)$ ]]; then SAVE_TO_FILE="TRUE"; echo -n "Cale fisier (implicit: $OUT_PATH): "; read -r resp; [ -n "$resp" ] && OUT_PATH="$resp"; else SAVE_TO_FILE="FALSE"; fi
 
-  local hash
-  hash=$(do_hash "$pw") || die "Eroare la generarea hash-ului."
-  unset pw pw2
-  if [ "$SAVE_TO_FILE" = "TRUE" ]; then write_secure_file "$OUT_PATH" "$hash" || die "Nu am putut scrie in fisier: $OUT_PATH"; echo "Hash salvat in: $OUT_PATH"; fi
-  copy_with_autoclear "$hash" "$AUTOCLEAR"
+    local def_clip=$( [ "$COPY_TO_CLIPBOARD" = "TRUE" ] && echo "Y" || echo "N" )
+    echo -n "Copiaza in clipboard? [Y/n] (implicit: $def_clip): "; read -r resp
+    if [[ "$resp" =~ ^([nN]|no|No)$ ]]; then COPY_TO_CLIPBOARD="FALSE"; else COPY_TO_CLIPBOARD="TRUE"; fi
+    if [ "$COPY_TO_CLIPBOARD" = "TRUE" ]; then echo -n "Auto-clear clipboard (sec) [0=off] (implicit: $AUTOCLEAR): "; read -r resp; [[ "$resp" =~ ^[0-9]+$ ]] && AUTOCLEAR="$resp"; fi
 
-  echo "Hash:"
-  echo "$hash"
+    local hash
+    if ! hash=$(do_hash "$pw"); then echo "Eroare la generarea hash-ului."; unset pw pw2; continue; fi
+    unset pw pw2
+
+    if [ "$SAVE_TO_FILE" = "TRUE" ]; then write_secure_file "$OUT_PATH" "$hash" || echo "Nu am putut scrie in fisier: $OUT_PATH"; echo "Hash salvat in: $OUT_PATH"; fi
+    copy_with_autoclear "$hash" "$AUTOCLEAR"
+
+    echo "Hash:"
+    echo "$hash"
+
+    echo -n "Generezi alt hash? [y/N]: "
+    read -r resp
+    [[ "$resp" =~ ^([yY]|yes|Yes)$ ]] || break
+  done
 }
 
 # --------- CLI non-interactiv (argumente) ---------
@@ -309,9 +390,14 @@ Altele:
   -h, --help                  Ajutor
 
 Exemple:
-  echo -n 'S3cr3t' | ./argon2_hash_tool.sh --non-interactive --password-stdin --type id -t 4 -m 64 -p 4 -l 32 --clipboard --autoclear 15
-  ./argon2_hash_tool.sh --non-interactive --password-file /root/pw.txt --type argon2id -t 3 -m 128 --out /root/hash.txt --save
-  ARGON2_PASSWORD='S3cr3t' ./argon2_hash_tool.sh --non-interactive --password-env ARGON2_PASSWORD --salt "$(openssl rand -base64 16)"
+  echo -n 'S3cr3t' | ./argon2_hash_tool.sh --non-interactive --password-stdin \
+    --type id -t 4 -m 64 -p 4 -l 32 --clipboard --autoclear 15 --out /tmp/hash.txt
+
+  ./argon2_hash_tool.sh --non-interactive --password-file /root/pw.txt \
+    --type argon2id -t 3 -m 128 --save --out /root/hash.txt
+
+  ARGON2_PASSWORD='S3cr3t' ./argon2_hash_tool.sh --non-interactive \
+    --password-env ARGON2_PASSWORD --salt "$(openssl rand -base64 16)" -t 4 -m 64 -p 4 -l 32
 EOF
 }
 
@@ -320,7 +406,6 @@ run_noninteractive() {
 
   local pw=""
   if [ "$PASSWORD_STDIN" = "TRUE" ]; then
-    # citeste tot stdin (nu mascheaza vizual input-ul, by design pentru pipe)
     pw=$(cat)
   elif [ -n "$PASSWORD_FILE" ]; then
     [ -r "$PASSWORD_FILE" ] || die "Nu pot citi fisierul parolei: $PASSWORD_FILE"
@@ -330,18 +415,15 @@ run_noninteractive() {
   elif [ -n "${ARGON2_PASSWORD:-}" ]; then
     pw="$ARGON2_PASSWORD"
   else
-    die "In modul non-interactiv trebuie sa furnizezi parola prin --password-stdin, --password-file sau --password-env (sau env ARGON2_PASSWORD)."
+    die "In modul non-interactiv furnizeaza parola prin --password-stdin, --password-file sau --password-env (sau env ARGON2_PASSWORD)."
   fi
 
-  # elimina un newline final (daca exista)
   pw="${pw%$'\n'}"
   [ -z "$pw" ] && die "Parola nu poate fi goala."
 
-  # daca --save fara --out -> foloseste implicit OUT_PATH
   if [ "$SAVE_TO_FILE" = "TRUE" ] && [ -z "$OUT_PATH" ]; then
     OUT_PATH="$HOME/hash_output.txt"
   fi
-
   local hash
   hash=$(do_hash "$pw") || die "Eroare la generarea hash-ului."
   unset pw
@@ -386,7 +468,7 @@ case "$MODE" in
   gui) can_gui || die "GUI indisponibil. Foloseste --mode tui/cli sau --non-interactive."; run_gui ;;
   tui) if can_dialog; then run_tui_dialog; elif can_whiptail; then run_tui_whiptail; else die "dialog/whiptail indisponibile."; fi ;;
   cli) run_cli_interactive ;;
-  auto|*)
+  auto|*) 
     if can_gui; then
       run_gui
     elif can_dialog; then
